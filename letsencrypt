@@ -17,8 +17,7 @@ import textwrap
 import time
 
 
-CA = "https://acme-staging.api.letsencrypt.org"
-# CA = "https://acme-v01.api.letsencrypt.org"
+CA = "https://acme-v01.api.letsencrypt.org"
 TOS = "https://letsencrypt.org/documents/LE-SA-v1.0.1-July-27-2015.pdf"
 
 log = logging.getLogger("letsencrypt")
@@ -322,7 +321,11 @@ def main():
             """))
     parser.add_argument(
         "--verbose", "-v", dest="verbosity", help="verbose mode",
-        action="store_const", default=logging.INFO, const=logging.DEBUG,)
+        action="store_const", default=logging.INFO, const=logging.DEBUG)
+    parser.add_argument(
+        "--staging-ca", dest="ca", help="use staging CA", action="store_const",
+        default="https://acme-v01.api.letsencrypt.org",
+        const="https://acme-staging.api.letsencrypt.org")
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -355,9 +358,14 @@ def main():
 
     args = parser.parse_args()
 
-    # Set level to logging.DEBUG if -v is specified
+    # Set level to logging.DEBUG if --verbose is specified
     # Otherwise defaults to logging.INFO
     log.setLevel(args.verbosity)
+
+    # Set CA to staging CA if --staging-ca is specified
+    # Otherwise defaults to production CA
+    global CA
+    CA = args.ca
 
     if args.command == "issue":
         issue(args.account_key, args.email, args.csr_path,
