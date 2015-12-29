@@ -1,0 +1,372 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import argparse
+import base64
+import binascii
+import functools
+import hashlib
+import json
+import logging
+import os
+import re
+import requests
+import subprocess
+import sys
+import textwrap
+import time
+
+
+CA = "https://acme-staging.api.letsencrypt.org"
+# CA = "https://acme-v01.api.letsencrypt.org"
+TOS = "https://letsencrypt.org/documents/LE-SA-v1.0.1-July-27-2015.pdf"
+
+log = logging.getLogger("letsencrypt")
+log.addHandler(logging.StreamHandler())
+
+
+def _b64encode(s):
+    """bytes to base64"""
+    return base64.urlsafe_b64encode(s).rstrip(b"=")
+
+
+# def _b64decode(s):
+#     """base64 to bytes"""
+#     return base64.urlsafe_b64decode(s + b"=" * (4 - (len(s) % 4)))
+
+
+def _read_account_key(key):
+    proc = subprocess.Popen(
+        ["openssl", "rsa", "-in", key, "-noout", "-text"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = proc.communicate()
+    if proc.returncode != 0:
+        raise IOError("OpenSSL Error: {0}".format(err))
+
+    _mod, _exp = re.search(
+        r"modulus:\n\s+00:([a-f0-9\:\s]+?)\npublicExponent: ([0-9]+)",
+        out).groups()
+    pub_mod = re.sub(r"(\s|:)", "", _mod)
+    pub_exp = "{0:0{1}x}".format(int(_exp), len(_exp) + len(_exp) % 2)
+
+    header = {
+        "alg": "RS256",
+        "jwk": {
+            "e": _b64encode(binascii.unhexlify(pub_exp)),
+            "kty": "RSA",
+            "n": _b64encode(binascii.unhexlify(pub_mod)),
+        },
+    }
+    _key_json = json.dumps(
+        header["jwk"], sort_keys=True, separators=(",", ":"))
+    thumbprint = _b64encode(hashlib.sha256(_key_json).digest())
+    return header, thumbprint
+
+
+def _build_payload(payload, key, header):
+    payload64 = _b64encode(json.dumps(payload))
+
+    protected = header.copy()
+    protected["nonce"] = requests.get(CA + "/directory").headers["replay-nonce"]
+    protected64 = _b64encode(json.dumps(protected))
+
+    proc = subprocess.Popen(
+        ["openssl", "dgst", "-sha256", "-sign", key], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = proc.communicate(
+        "{0}.{1}".format(protected64, payload64).encode("utf-8"))
+    if proc.returncode != 0:
+        raise IOError("OpenSSL Error: {0}".format(err))
+
+    return json.dumps({
+        "header": header, "protected": protected64, "payload": payload64,
+        "signature": _b64encode(out),
+    })
+
+
+def _log_response(r, *args, **kwargs):
+    log.debug(
+        "\n".join(
+            ["-" * 20, "{} {}".format(str(r.status_code), r.url),
+             json.dumps(dict(r.headers), sort_keys=True, separators=(",", ":")),
+             r.content, "-" * 20]))
+
+
+def _prompt(q):
+    _ = sys.stdout
+    try:
+        sys.stdout = sys.stderr
+        return raw_input(q)
+    finally:
+        sys.stdout = _
+
+
+def _cleanup(paths):
+    for p in paths.itervalues():
+        os.remove(p)
+
+
+def issue(key, email, csr_path, challenge_dir="./", manual=False, out_path=None):
+    log.info("Reading account key...")
+    header, thumbprint = _read_account_key(key)
+    build_payload = functools.partial(_build_payload, key=key, header=header)
+
+    # Parse CSR
+    log.info("Parsing CSR...")
+
+    proc = subprocess.Popen(
+        ["openssl", "req", "-in", csr_path, "-noout", "-text"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = proc.communicate()
+
+    if proc.returncode != 0:
+        raise IOError("Error loading {0}: {1}".format(csr_path, err))
+
+    domains = set()
+    cn = re.search(r"Subject:.*? CN=([^\s,;/]+)", out)
+    if cn is not None:
+        domains.add(cn.group(1))
+    sans = re.search(r"X509v3 Subject Alternative Name:\s+([^\n]+)\n", out)
+    if sans is not None:
+        for san in sans.group(1).split(", "):
+            if san.startswith("DNS:"):
+                domains.add(san[4:])
+
+    for domain in domains:
+        log.info("Found: {0}".format(domain))
+
+    # Register with CA
+    log.info("Registering...")
+
+    r = requests.post(CA + "/acme/new-reg", data=build_payload({
+        "resource": "new-reg",
+        "contact": ["mailto:{0}".format(email)],
+        "agreement": TOS,
+    }), hooks=dict(response=_log_response))
+
+    if r.status_code == 201:
+        log.info("Registering...registered")
+    elif r.status_code == 409:
+        log.info("Registering...already registered")
+    else:
+        raise Exception("Error registering {0}: {1}".format(email, r.content))
+
+    # Authenticate domains
+    _paths = {}
+    challenges = {}
+    for domain in domains:
+        log.info("Authenticating {0}...".format(domain))
+
+        # Request challenge
+        r = requests.post(CA + "/acme/new-authz", data=build_payload({
+            "resource": "new-authz",
+            "identifier": {"type": "dns", "value": domain},
+        }), hooks=dict(response=_log_response))
+
+        if r.status_code != 201:
+            raise Exception(
+                "Error requesting challenge for {0}: {1}".format(
+                    domain, r.content))
+
+        # Generate challenge response
+        challenge = [c for c in r.json()["challenges"] if c["type"] == "http-01"][0]
+        token = re.sub(r"[^A-Za-z0-9_\-]", "_", challenge['token'])
+        keyauthorization = "{0}.{1}".format(token, thumbprint)
+        _path = os.path.join(challenge_dir, token)
+        with open(_path, "w") as f:
+            f.write(keyauthorization)
+
+        # Save path and challenge for polling
+        _paths[domain] = _path
+        challenges[domain] = challenge
+
+        if manual:
+            log.debug("Confirm checking challenge response")
+            _prompt("Check challenge response?")
+
+        # Check challenge response
+        retries = 5
+        _url = "http://{0}/.well-known/acme-challenge/{1}".format(domain, token)
+
+        while retries:
+            try:
+                assert requests.get(_url).content == keyauthorization
+            except (IOError, AssertionError) as e:
+                log.error(
+                    "Error checking challenge response {0}: {1}, retry...".format(
+                        _url, repr(e)))
+                retries -= 1
+                continue
+            break
+
+        if not retries:
+            _cleanup(paths)
+            raise Exception(
+                "Error checking challenge response, max retries exceeded")
+
+        if manual:
+            log.debug("Confirm notifying CA")
+            _prompt("Notify CA?")
+
+        # Notify CA
+        r = requests.post(challenge["uri"], data=build_payload({
+            "resource": "challenge",
+            "keyAuthorization": keyauthorization,
+        }), hooks=dict(response=_log_response))
+
+        if r.status_code != 202:
+            _cleanup(paths)
+            raise Exception(
+                "Error triggering challenge: {0}".format(r.content))
+
+    # Polling for challenge results
+    retries = 10
+    valid_count = 0
+
+    while valid_count < len(challenges) and retries:
+        for domain, challenge in challenges.iteritems():
+            try:
+                r = requests.get(challenge["uri"],
+                                 hooks=dict(response=_log_response))
+                ret = r.json()
+            except (IOError, ValueError) as e:
+                log.error(
+                    "Error checking challenge status: {0}, retry...".format(
+                        repr(e)))
+                retries -= 1
+                continue
+            if ret["status"] == "pending":
+                continue
+            elif ret["status"] == "valid":
+                log.info("Authenticating {0}...done".format(domain))
+                os.remove(_paths[domain])
+                valid_count += 1
+            else:
+                _cleanup(paths)
+                raise Exception(
+                    "Error authenticating {0}: {1}".format(domain, ret))
+            time.sleep(2)
+
+    if not retries:
+        _cleanup(paths)
+        raise Exception("Error connecting to CA, max retries exceeded")
+
+    # Ask CA to issue certificate
+    log.info("Issuing certificate...")
+
+    proc = subprocess.Popen(
+        ["openssl", "req", "-in", csr_path, "-outform", "DER"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = proc.communicate()
+
+    r = requests.post(CA + "/acme/new-cert", data=build_payload({
+        "resource": "new-cert",
+        "csr": _b64encode(out),
+    }))
+
+    if r.status_code != 201:
+        _cleanup(paths)
+        raise Exception("Error signing certificate: {1}".format(r.content))
+
+    sys.stdout.write(
+        """-----BEGIN CERTIFICATE-----\n{0}\n-----END CERTIFICATE-----\n""".format(
+            "\n".join(textwrap.wrap(base64.b64encode(r.content), 64))))
+
+
+def revoke(key, crt_path):
+    log.info("Reading account key...")
+    header, _ = _read_account_key(key)
+    build_payload = functools.partial(_build_payload, key=key, header=header)
+
+    # Ask CA to revoke certificate
+    log.info("Revoking certificate...")
+
+    proc = subprocess.Popen(
+        ["openssl", "x509", "-in", crt_path, "-outform", "DER"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = proc.communicate()
+
+    r = requests.post(CA + "/acme/revoke-cert", data=build_payload({
+        "resource": "revoke-cert",
+        "certificate": _b64encode(out),
+    }), hooks=dict(response=_log_response))
+
+    if r.status_code == 200:
+        log.info("Certificate {0} revoked".format(crt_path))
+    elif r.status_code == 409:
+        log.info("Certificate {0} already revoked".format(crt_path))
+    else:
+        raise Exception("Error revoking certificate {0}: {1}".format(crt_path, r.content))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent(r"""
+            Let's Encrypt!
+
+            Before we can do anything, generate an account key first if you don't have one.
+
+                $ openssl genrsa -out account.key 4096
+
+            Generate a domain key and CSR.
+
+                $ openssl genrsa -out domain.key 4096
+                $ openssl req -key domain.key -new -sha256 -subj "/CN=example.com" -out domain.csr
+
+            Alternatively, if you need a SAN certificate.
+
+                $ openssl req -key domain.key -new -sha256 -subj "/" -out domain.csr \
+                    -reqexts SAN \
+                    -config <(cat /path/to/openssl.cnf <(printf "[SAN]\nsubjectAltName=DNS:example.com,DNS:www.example.com"))
+            """))
+    parser.add_argument(
+        "--verbose", "-v", dest="verbosity", help="verbose mode",
+        action="store_const", default=logging.INFO, const=logging.DEBUG,)
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Issue arguments
+    issue_parser = subparsers.add_parser("issue", help="issue a certificate",
+                                         description="Issue a certificate.")
+    issue_parser.add_argument(
+        "--account-key", required=True,
+        help="path to your account account key, in PEM format")
+    issue_parser.add_argument(
+        "--email", required=True,
+        help="contact email, required to register Let's Encrypt account")
+    issue_parser.add_argument(
+        "--challenge-dir", default="./",
+        help="directory to put challenge files, defaults to PWD")
+    issue_parser.add_argument(
+        "--manual", action="store_true",
+        help="prompt before checking challenge response and notifying CA")
+    issue_parser.add_argument(
+        "csr_path", help="path to your Certificate Signing Request")
+
+    # Revoke arguments
+    revoke_parser = subparsers.add_parser("revoke", help="revoke a certificate",
+                                          description="Revoke a certificate.")
+    revoke_parser.add_argument(
+        "--account-key", required=True,
+        help="path to your account account key, in PEM format")
+    revoke_parser.add_argument(
+        "crt_path", help="path to your to-be-revoked certificate")
+
+    args = parser.parse_args()
+
+    # Set level to logging.DEBUG if -v is specified
+    # Otherwise defaults to logging.INFO
+    log.setLevel(args.verbosity)
+
+    if args.command == "issue":
+        issue(args.account_key, args.email, args.csr_path,
+              challenge_dir=args.challenge_dir, manual=args.manual)
+    elif args.command == "revoke":
+        revoke(args.account_key, args.crt_path)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
