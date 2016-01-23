@@ -199,7 +199,7 @@ def issue(key, email, csr_path, challenge_dir="./", manual=False, out_path=None)
             break
 
         if not retries:
-            _cleanup(paths)
+            _cleanup(_paths)
             raise Exception(
                 "Error checking challenge response, max retries exceeded")
 
@@ -214,7 +214,7 @@ def issue(key, email, csr_path, challenge_dir="./", manual=False, out_path=None)
         }), hooks=dict(response=_log_response))
 
         if r.status_code != 202:
-            _cleanup(paths)
+            _cleanup(_paths)
             raise Exception(
                 "Error triggering challenge: {0}".format(r.content))
 
@@ -241,13 +241,14 @@ def issue(key, email, csr_path, challenge_dir="./", manual=False, out_path=None)
                 os.remove(_paths[domain])
                 valid_count += 1
             else:
-                _cleanup(paths)
+                _cleanup(_paths)
                 raise Exception(
                     "Error authenticating {0}: {1}".format(domain, ret))
             time.sleep(2)
 
+    _cleanup(_paths)
+
     if not retries:
-        _cleanup(paths)
         raise Exception("Error connecting to CA, max retries exceeded")
 
     # Ask CA to issue certificate
@@ -264,7 +265,6 @@ def issue(key, email, csr_path, challenge_dir="./", manual=False, out_path=None)
     }))
 
     if r.status_code != 201:
-        _cleanup(paths)
         raise Exception("Error signing certificate: {1}".format(r.content))
 
     sys.stdout.write(
