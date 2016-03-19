@@ -29,11 +29,6 @@ def _b64encode(s):
     return base64.urlsafe_b64encode(s).rstrip(b"=")
 
 
-# def _b64decode(s):
-#     """base64 to bytes"""
-#     return base64.urlsafe_b64decode(s + b"=" * (4 - (len(s) % 4)))
-
-
 def _read_account_key(key):
     proc = subprocess.Popen(
         ["openssl", "rsa", "-in", key, "-noout", "-text"],
