@@ -18,7 +18,7 @@ import time
 
 
 CA_PROD = "https://acme-v01.api.letsencrypt.org"
-CA_STAGE = "https://acme-staging.api.letsencrypt.org"
+CA_STAG = "https://acme-staging.api.letsencrypt.org"
 TOS = "https://letsencrypt.org/documents/LE-SA-v1.1.1-August-1-2016.pdf"
 
 log = logging.getLogger("letsencrypt")
@@ -38,9 +38,9 @@ def _read_account_key(key):
     if proc.returncode != 0:
         raise IOError("OpenSSL Error: {0}".format(err))
 
-    _mod, _exp = re.search(
-        r"modulus:\n\s+00:([a-f0-9\:\s]+?)\npublicExponent: ([0-9]+)",
-        out).groups()
+    _p = r"modulus:\n\s+00:([a-f0-9\:\s]+?)\npublicExponent: ([0-9]+)"
+    _mod, _exp = re.search(_p, out).groups()
+
     pub_mod = re.sub(r"(\s|:)", "", _mod)
     pub_exp = "{0:0{1}x}".format(int(_exp), len(_exp) + len(_exp) % 2)
 
@@ -320,7 +320,7 @@ def main():
         action="store_const", default=logging.INFO, const=logging.DEBUG)
     parser.add_argument(
         "--staging-ca", dest="ca", help="use staging CA", action="store_const",
-        default=CA_PROD, const=CA_STAGE)
+        default=CA_PROD, const=CA_STAG)
 
     subparsers = parser.add_subparsers(dest="command")
 
