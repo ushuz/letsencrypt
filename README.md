@@ -51,9 +51,9 @@ folder and read your private account key and CSR.
 
 ### Install the certificate
 
-Bundle `domain.crt` with the intermediate certificate of Let's Encrypt.
+Bundle `domain.crt` with the **Let’s Encrypt Authority X3** intermediate certificate.
 
-    $ curl https://letsencrypt.org/certs/lets-encrypt-x1-cross-signed.pem -o intermediate.crt
+    $ curl https://letsencrypt.org/certs/lets-encrypt-x3-cross-signed.pem -o intermediate.crt
     $ cat domain.crt intermediate.crt > chained.crt
 
 Then enable SSL.
@@ -88,7 +88,7 @@ Create a `renew.sh`.
     # request certificate
     /path/to/letsencrypt --account-key /path/to/account.key --email admin@example.com --challenge-dir /srv/letsencrypt/challenges/ /path/to/domain.csr > /path/to/domain.crt
     # make chain
-    curl https://letsencrypt.org/certs/lets-encrypt-x1-cross-signed.pem -o /path/to/intermediate.crt
+    curl https://letsencrypt.org/certs/lets-encrypt-x3-cross-signed.pem -o /path/to/intermediate.crt
     cat /path/to/domain.crt /path/to/intermediate.crt > /path/to/chained.crt
     # reload nginx
     sudo service nginx reload
